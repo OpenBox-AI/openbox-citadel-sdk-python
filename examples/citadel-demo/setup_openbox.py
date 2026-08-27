@@ -123,6 +123,12 @@ BEHAVIOR_RULE = {
 
 # ── plumbing ───────────────────────────────────────────────────────────
 
+USER_AGENT = "openbox-citadel-demo/0.1 (+https://openbox.ai)"
+"""urllib's default (`Python-urllib/x.y`) is refused at the edge with a 403
+and `error code: 1010`, before the request reaches the API. Any honest
+identifier gets through; the point is simply not to send urllib's."""
+
+
 class Api:
     def __init__(self, base: str, key: str, dry_run: bool) -> None:
         self.base = base.rstrip("/")
@@ -138,13 +144,19 @@ class Api:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(
             url, data=data, method=method,
-            headers={"x-api-key": self.key, "Content-Type": "application/json"})
+            headers={"x-api-key": self.key, "Content-Type": "application/json",
+                     "User-Agent": USER_AGENT})
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 raw = response.read()
                 return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode()[:400]
+            if exc.code == 403 and "error code: 1010" in detail:
+                sys.exit(f"\n403 from {path} — blocked by the edge before the API "
+                         f"saw the request, on the client signature.\n{detail}\n"
+                         f"The API key was never evaluated. Send a User-Agent "
+                         f"header (this script sets {USER_AGENT!r}).")
             if exc.code in (401, 403):
                 sys.exit(f"\n{exc.code} from {path} — the API key is missing a "
                          f"permission, or is not an organisation key.\n{detail}\n"
@@ -152,10 +164,25 @@ class Api:
             raise SystemExit(f"\n{method} {path} failed: {exc.code}\n{detail}")
 
 
+def rows_of(payload: object) -> list[dict]:
+    """The rows out of any envelope the API wraps them in.
+
+    Paginated endpoints answer `{status, data: {data: [...], total}}` — two
+    `data` layers. Peeling one leaves the inner dict, which iterates as key
+    strings, so every lookup silently finds nothing.
+    """
+    seen = 0
+    while isinstance(payload, dict) and seen < 4:
+        payload = payload.get("data") or payload.get("items") or []
+        seen += 1
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    return []
+
+
 def find_by(items: object, field: str, value: str) -> dict | None:
-    rows = items if isinstance(items, list) else (items or {}).get("data") or []
-    for row in rows:
-        if isinstance(row, dict) and row.get(field) == value:
+    for row in rows_of(items):
+        if row.get(field) == value:
             return row
     return None
 
@@ -190,7 +217,7 @@ def main() -> None:
     print(f"platform : {base}")
 
     # ── agent ──────────────────────────────────────────────────────────
-    agents = api("GET", "/agent") if key else []
+    agents = api("GET", "/agent/list") if key else []
     agent = find_by(agents, "agent_name", AGENT_NAME) or find_by(agents, "name", AGENT_NAME)
     if agent:
         agent_id = agent.get("id")
@@ -199,7 +226,7 @@ def main() -> None:
         print(f"agent    : MISSING — {AGENT_NAME!r} does not exist")
         return
     else:
-        created = api("POST", "/agent", {
+        created = api("POST", "/agent/create", {
             "agent_name": AGENT_NAME,
             "agent_type": "temporal",
             "description": "Citadel-shaped demo agent, governed by OpenBox",

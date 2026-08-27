@@ -8,6 +8,7 @@ from typing import Any
 
 from openbox_citadel.config import DEFAULT_APPROVAL_MAX_WAIT_SECONDS, GovernanceConfig
 from openbox_citadel.middleware import (
+    CORE_ENV_PREFIX,
     TASK_QUEUE,
     OpenBoxCitadelMiddleware,
     OpenBoxCitadelMiddlewareOptions,
@@ -59,16 +60,21 @@ def create_openbox_citadel_middleware(
         resolved_config.session_id = session_id
 
     if validate:
-        from openbox_langgraph.config import initialize as _initialize
+        # The base normalizer: URL security (refuses non-localhost http://),
+        # timeout coercion, API-key format, and the DID/private-key
+        # both-or-neither rule. Raises OpenBoxConfigError on a bad config, which
+        # is the point of asking — fail at construction, not mid-turn.
+        from openbox_core.config import OpenBoxConfig
 
-        _initialize(
+        OpenBoxConfig.resolve(
+            env_prefix=CORE_ENV_PREFIX,
             api_url=resolved_url,
             api_key=resolved_key,
-            governance_timeout=governance_timeout,
-            validate=True,
+            timeout_seconds=governance_timeout,
             agent_did=agent_did or os.environ.get("OPENBOX_AGENT_DID"),
             agent_private_key=agent_private_key
             or os.environ.get("OPENBOX_AGENT_PRIVATE_KEY"),
+            validate=True,
         )
 
     return OpenBoxCitadelMiddleware(

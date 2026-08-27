@@ -13,12 +13,33 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from openbox_langgraph.client import build_auth_headers
-from openbox_langgraph.config import parse_optional_agent_identity_config
+from openbox_core.identity import AgentIdentity, prepare_signed_request
 
 from openbox_citadel.types import to_server_event_type
 
 logger = logging.getLogger("openbox_citadel.client")
+
+SDK_ENGINE = "citadel"
+SDK_LANGUAGE = "python"
+SDK_VERSION = "0.1.0"
+
+
+def _optional_identity(did: str | None, private_key: str | None) -> AgentIdentity | None:
+    """Both or neither — one alone is a misconfiguration, not unsigned mode.
+
+    Returning `None` when only the DID is set would silently downgrade to
+    bare-Bearer at the trust boundary, which is the failure this refuses.
+    """
+    did = (did or "").strip() or None
+    private_key = (private_key or "").strip() or None
+    if did is None and private_key is None:
+        return None
+    if did is None or private_key is None:
+        raise ValueError(
+            "Both OPENBOX_AGENT_DID and OPENBOX_AGENT_PRIVATE_KEY are required "
+            "when enabling OpenBox agent identity signing."
+        )
+    return AgentIdentity.from_private_key(did, private_key)
 
 
 class OpenBoxAuthError(Exception):
@@ -52,9 +73,7 @@ class GovernanceClient:
         self._on_api_error = on_api_error
         self._fail_hard_on_auth_error = fail_hard_on_auth_error
         self._client: httpx.AsyncClient | None = None
-        self._identity = parse_optional_agent_identity_config(
-            did=agent_did, private_key=agent_private_key
-        )
+        self._identity = _optional_identity(agent_did, agent_private_key)
 
     def _http(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -75,14 +94,25 @@ class GovernanceClient:
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
         import json
 
-        body = json.dumps(payload, default=str).encode()
-        headers = build_auth_headers(
-            self._api_key,
-            method="POST",
-            pathname=path,
-            body=body,
-            agent_identity=self._identity,
+        # Core hashes the body it is given and Core verifies that hash, so the
+        # bytes signed must be the bytes sent — `prepare_signed_request` returns
+        # both together for exactly that reason. Never re-serialize with `json=`.
+        #
+        # The round-trip through `default=str` first is what keeps a datetime or
+        # UUID anywhere in an event from raising: core's serializer is strict,
+        # and this SDK's payloads have always been built leniently.
+        plain = json.loads(json.dumps(payload, default=str))
+        headers, body = prepare_signed_request(
+            "POST",
+            path,
+            plain,
+            api_key=self._api_key,
+            identity=self._identity,
+            sdk_version=SDK_VERSION,
+            sdk_engine=SDK_ENGINE,
+            sdk_language=SDK_LANGUAGE,
         )
+        headers.setdefault("Content-Type", "application/json")
         response = await self._http().post(f"{self._api_url}{path}", content=body, headers=headers)
         if response.status_code in (401, 403):
             # Distinct from a transport failure: this will not come right on

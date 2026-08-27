@@ -74,14 +74,29 @@ def _canonical(operation: str, fallback: str) -> str:
 
 
 def install_file_span_corrections() -> bool:
-    """Wrap the hook layer's file span builder. Idempotent; safe to call often."""
+    """Wrap the hook layer's file span builder. Idempotent; safe to call often.
+
+    Mostly historical now. File hooks moved into `openbox_core`, whose builder
+    derives the span name from the open mode (`_file_span_name`) and so already
+    files a write as `file.write` — the misclassification this module existed to
+    fix is gone upstream. What did NOT come across is per-operation timing: core
+    sends no duration, so a started/completed pair still lands as two
+    same-instant events.
+
+    When the legacy module is absent this reports it and installs nothing,
+    rather than returning a success that corrects a builder nothing calls.
+    """
     global _installed
     if _installed:
         return True
     try:
         from openbox_langgraph import file_governance_hooks as hooks
     except Exception:  # noqa: BLE001 — hook layer absent or moved
-        logger.debug("file hook module unavailable; file spans left uncorrected")
+        logger.info(
+            "file span corrections not installed: the legacy hook builder is gone. "
+            "Canonical naming is handled by openbox_core; per-operation duration "
+            "is not sent by it, so file start/completion pairs share a timestamp."
+        )
         return False
 
     original = getattr(hooks, "_build_file_span_data", None)
