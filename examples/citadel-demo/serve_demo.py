@@ -52,6 +52,10 @@ still works — the page just shows the workflow_id instead of a link.
 All three are resolved in `main()`, AFTER .env is loaded. Reading them at import
 time made the file's defaults win over the .env every time."""
 
+USER_AGENT = "openbox-citadel-demo/0.1 (+https://openbox.ai)"
+"""urllib's default (`Python-urllib/x.y`) is refused at the edge with a 403
+and `error code: 1010`, before the request reaches the API."""
+
 RUN_LOCK = asyncio.Lock()
 """One turn at a time. `SIDE_EFFECTS` is module-global and the approval controls
 address a single pending activity, so concurrent turns would report each other's
@@ -77,7 +81,8 @@ def platform(path: str, method: str = "GET", body: dict | None = None) -> Any:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         f"{PLATFORM_API}{path}", data=data, method=method,
-        headers={"x-api-key": PLATFORM_KEY, "Content-Type": "application/json"})
+        headers={"x-api-key": PLATFORM_KEY, "Content-Type": "application/json",
+                 "User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=15) as response:
             raw = response.read()
@@ -92,12 +97,19 @@ def logger_warn(message: str) -> None:
 
 
 def rows_of(payload: Any) -> list[dict]:
-    """Both list and {data: [...]} shapes come back from the API."""
+    """The rows out of any envelope the API wraps them in.
+
+    Paginated endpoints answer `{status, data: {data: [...], total}}` — two
+    `data` layers, not one. Peeling a single layer yields the inner *dict*,
+    whose iteration gives key strings and no rows at all, so the caller sees
+    an empty list and reports the thing it asked for as missing.
+    """
+    seen = 0
+    while isinstance(payload, dict) and seen < 4:
+        payload = payload.get("data") or payload.get("items") or []
+        seen += 1
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
-    if isinstance(payload, dict):
-        inner = payload.get("data") or payload.get("items") or []
-        return [row for row in inner if isinstance(row, dict)]
     return []
 
 
@@ -110,7 +122,7 @@ def resolve_agent_id() -> str:
     did = os.environ.get("OPENBOX_AGENT_DID", "")
     if not did:
         return ""
-    for row in rows_of(platform("/agent")):
+    for row in rows_of(platform("/agent/list")):
         if row.get("did") == did:
             return str(row.get("id") or "")
     return ""
@@ -459,9 +471,14 @@ def main() -> None:
 
     AGENT_ID = resolve_agent_id()
     if not AGENT_ID:
+        reason = ("OPENBOX_PLATFORM_API_KEY is not set (see SETUP.md)"
+                  if not PLATFORM_KEY else
+                  "the key is set, so check the warning above for the real cause "
+                  "— a 403 with 'error code: 1010' is an edge block on the client "
+                  "signature, not a permission problem")
         print("  [warn] could not resolve the agent's id — runs will show a "
               "workflow_id instead of a dashboard link.\n"
-              "         Set OPENBOX_PLATFORM_API_KEY (see SETUP.md) to enable it.")
+              f"         {reason}.")
     import uvicorn
     print(f"Citadel demo front end → http://127.0.0.1:{PORT}")
     uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
