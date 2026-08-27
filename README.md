@@ -17,26 +17,6 @@ python setup_openbox.py       # creates the agent and its controls
 python serve_demo.py          # http://127.0.0.1:8010
 ```
 
-## Why this is not the LangChain SDK
-
-`openbox-langchain-sdk-python` attaches through LangChain's `AgentMiddleware`,
-passed to `create_agent(middleware=[...])`. Citadel has no such call. It runs
-two hand-built execution paths:
-
-| Path | Where | Tool loop |
-|---|---|---|
-| Direct chat | `engine/graph/nodes/turn.py` | hand-rolled `astream` + tool loop |
-| Campaigns | `engine/crew/executor.py` | CrewAI `kickoff()` via a sync adapter |
-
-They share exactly one thing, and it is the thing that makes this SDK small:
-**both receive their tools from `engine/tools/loader.py`**, where every bound
-tool is wrapped by `guarded(decl.name, ctx)`. One decorator site covers the
-entire tool surface of both paths.
-
-So this SDK ships explicit wrappers instead of a middleware class, and layers
-on `openbox-langgraph-sdk-python` for the client, envelope, verdict enforcement,
-HITL polling and DID identity.
-
 ## Install
 
 ```bash

@@ -13,7 +13,7 @@ you demo this to someone else.
 
 ## 1. An API key
 
-The one thing you create by hand, because it is what authorizes everything else.
+The one thing you create manually, because it is what authorizes everything else.
 
 **Dashboard → Organization → API keys → create**, with these permissions:
 
@@ -83,7 +83,7 @@ Skip to [step 3](#3-run-it).
 
 ---
 
-## 2b. By hand in the dashboard
+## 2b. Manually in the dashboard
 
 ### The agent
 
