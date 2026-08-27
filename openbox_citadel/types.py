@@ -1,9 +1,8 @@
-"""Core types. Field names mirror the other OpenBox SDKs exactly.
+"""Core types.
 
-Ported from the OpenRouter SDK's `types.ts`, which mirrors
-`openbox_langgraph/types.py`. Identical field names mean events are
-interchangeable between SDKs and Core classifies them the same way. Do not
-"tidy" a name here without changing every SDK.
+Field names are the wire contract, not a local style choice: the server
+classifies an event by the names it arrives under. Renaming one here changes
+what the server sees, so do not "tidy" a name without changing the protocol.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ def rfc3339_now() -> str:
 
 
 def hex_id(length: int = 32) -> str:
-    """Activity ids, matching the other SDKs' `hexId`."""
+    """Activity ids: lowercase hex, the form the server expects."""
     return secrets.token_hex(length // 2)
 
 

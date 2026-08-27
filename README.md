@@ -72,9 +72,6 @@ every wrapper degrades to a passthrough.
 | `middleware_factory.py` | 90 | `create_openbox_citadel_middleware` |
 | `config.py` | 40 | `GovernanceConfig`, `HITLConfig` |
 
-Ported from `openbox-openrouter-sdk`, which is the reference for the protocol
-details Core actually enforces.
-
 ## Ordering
 
 Core orders a session's events by the timestamp the SDK stamps, and the

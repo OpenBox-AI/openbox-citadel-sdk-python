@@ -47,7 +47,7 @@ class SequenceViolation:
 def _iso_ms(epoch_ms: int) -> str:
     """`2026-08-26T04:41:00.533Z` — always exactly three fractional digits.
 
-    Matching JavaScript's `toISOString()`, which the other SDKs use. A format
+    The `toISOString()` shape, and fixed width for a reason. A format
     that drops fractional seconds on a whole second sorts inconsistently as a
     string: `...:40Z` compares *before* `...:40.500Z` because `Z` < `.`.
     """

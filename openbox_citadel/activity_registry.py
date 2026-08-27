@@ -1,6 +1,5 @@
 """Per-activity state: span attribution, approval and abort flags.
 
-The Python counterpart of the OpenRouter SDK's `span_processor` bookkeeping.
 Three separate jobs, all keyed on `activity_id`:
 
 * **Attribution.** `current_activity()` is a `ContextVar`, so a span raised by

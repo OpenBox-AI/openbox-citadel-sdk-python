@@ -1,4 +1,4 @@
-"""Configuration. Field names match the other SDKs' `GovernanceConfig`."""
+"""Configuration for one governed deployment."""
 
 from __future__ import annotations
 

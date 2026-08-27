@@ -134,8 +134,8 @@ class GovernanceClient:
         """One HITL poll. `None` on a transport error so the caller can retry.
 
         When Core returned an approval id on the verdict, that id is the poll
-        key — and it goes in all three fields, which is how the other SDKs
-        address it. Only without one do we fall back to the run triple.
+        key — and it goes in all three fields, which is how the server
+        addresses it. Only without one do we fall back to the run triple.
         """
         if approval_id:
             payload = {

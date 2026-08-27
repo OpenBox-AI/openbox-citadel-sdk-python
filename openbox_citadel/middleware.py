@@ -52,7 +52,7 @@ CrewAI, and filtering a dashboard by framework only helps if the value is honest
 
 @dataclass
 class OpenBoxCitadelMiddlewareOptions:
-    """Construction options. Mirrors `OpenBoxLangChainMiddlewareOptions`."""
+    """Construction options."""
 
     api_url: str
     api_key: str
@@ -399,8 +399,8 @@ class OpenBoxCitadelMiddleware:
         because that is the field Core actually binds — its payload struct has
         no `workflow_output`, so an SDK sending only that has its final answer
         dropped at unmarshal and every WorkflowCompleted row lands with an empty
-        output. `workflow_output` goes too: Core ignores unknown keys, and it is
-        the name the other SDKs emit for anything reading the raw event stream.
+        output. `workflow_output` goes too: unknown keys are ignored, and it is
+        the conventional name for anything reading the raw event stream.
         """
         try:
             await self._close_dangling()
