@@ -10,10 +10,25 @@ readme = "README.md"
 requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "openbox-langgraph-sdk-python>=0.2.0",
+    # The base governance SDK, depended on directly. This used to be
+    # openbox-langgraph-sdk-python, which nothing here used for anything
+    # LangGraph-shaped — it was a route to the openbox_core underneath it, and
+    # it dragged langgraph, langchain-core and langsmith along for the ride.
+    #
+    # The unpinned lower bound was also the outage: >=0.2.0 admitted 1.0.0, and
+    # 1.0.0 removed the OTel entry point this SDK called, so an install with no
+    # code change lost every span. Hence the upper bound.
+    # [http] is NOT optional for this SDK. The opentelemetry-instrumentation-*
+    # packages live behind that extra, and without them every hook installer
+    # declines politely — the runtime arms, reports itself ready, and records
+    # zero spans. That is precisely the failure this SDK is meant to avoid, so
+    # the extra is declared rather than left to the installer.
+    "openbox-sdk-python[http]>=1.2.0,<2",
 ]
 
 [project.optional-dependencies]
+# Only needed when a host passes instrument_databases=True.
+db = ["openbox-sdk-python[db]>=1.2.0,<2"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

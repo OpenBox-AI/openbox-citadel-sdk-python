@@ -35,14 +35,21 @@ logger = logging.getLogger("openbox_citadel")
 _INSTRUMENTATION_READY = False
 """Whether this PROCESS has already installed OTel instrumentation."""
 
-_SHARED_SPAN_PROCESSOR: Any = None
-"""The one span processor wired into the tracer provider, shared by every
-middleware built afterwards. It keys its state by workflow_id, so one instance
-serves any number of concurrent runs."""
+_SHARED_RUNTIME: Any = None
+"""The one armed `openbox_core` runtime, shared by every middleware built
+afterwards. Attribution is per-activity in its `ContextStore`, so a single
+runtime serves any number of concurrent runs."""
 
-_INSTRUMENTED = {"databases": False, "file_io": False}
-"""What the first setup actually turned on, so a later middleware asking for
-more can have just the missing piece installed."""
+_INSTALLED_TARGETS: list[str] = []
+"""What the first setup actually patched, so a later middleware asking for a
+target that is not there can say so instead of silently governing nothing."""
+
+CORE_ENV_PREFIX = "OPENBOX_CITADEL"
+"""SDK env namespace. Resolution order is explicit > OPENBOX_CITADEL_* > OPENBOX_*."""
+
+SDK_ENGINE = "citadel"
+SDK_LANGUAGE = "python"
+SDK_VERSION = "0.1.0"
 
 TASK_QUEUE = "citadel"
 """Framework identifier. The live server accepts any string and new frameworks
@@ -132,7 +139,12 @@ class OpenBoxCitadelMiddleware:
             agent_private_key=options.agent_private_key,
         )
         self._otel_ready = False
-        self._span_processor: Any = None
+        self._runtime: Any = None
+        self._context_store: Any = None
+        self._ctx_tokens: dict[str, Any] = {}
+        """ContextVar reset tokens, keyed by activity_id. A token must be reset
+        in the context that bound it, so they are held per activity rather than
+        as one running stack."""
         self._workflow_id = ""
         self._run_id = ""
         self._workflow_type = "chat"
@@ -165,37 +177,38 @@ class OpenBoxCitadelMiddleware:
         workflow_id, which is exactly how it already keeps concurrent runs
         apart.
         """
-        global _INSTRUMENTATION_READY, _SHARED_SPAN_PROCESSOR
+        global _INSTRUMENTATION_READY, _SHARED_RUNTIME, _INSTALLED_TARGETS
 
         if self._otel_ready or not self._options.instrument_http:
             return
 
         if _INSTRUMENTATION_READY:
-            # Adopt the live processor. Building a fresh one here would leave
-            # this middleware registering activities on an object no exporter
-            # consults, and its spans would go unattributed.
-            self._span_processor = _SHARED_SPAN_PROCESSOR
-            self._install_extra_instrumentation()
+            # Adopt the live runtime. Building a second one would install a
+            # second set of hooks over the same interpreter and attribute spans
+            # into a ContextStore no exporter consults.
+            self._runtime = _SHARED_RUNTIME
+            self._context_store = _SHARED_RUNTIME.context_store
+            self._warn_absent_targets()
             self._otel_ready = True
             return
 
         try:
-            from openbox_langgraph.otel_setup import setup_opentelemetry_for_governance
-            from openbox_langgraph.span_processor import WorkflowSpanProcessor
+            self._runtime = self._build_core_runtime()
+            self._context_store = self._runtime.context_store
+            # Mirror the flat HTTP wire fields into attributes under the legacy
+            # keys core and the dashboard actually read. Without this a span
+            # arrives with url.full only: no request link, no status badge, and
+            # no identity for core's fingerprint.
+            from openbox_citadel.span_aliases import install_span_attribute_aliases
 
-            self._span_processor = WorkflowSpanProcessor()
-            setup_opentelemetry_for_governance(
-                self._span_processor,
-                self._options.api_url,
-                self._options.api_key,
-                instrument_databases=self._options.instrument_databases,
-                instrument_file_io=self._options.instrument_file_io,
-                sqlalchemy_engine=self._options.sqlalchemy_engine,
-                api_timeout=self._options.governance_timeout,
-                on_api_error=self._options.on_api_error,
-                agent_did=self._options.agent_did,
-                agent_private_key=self._options.agent_private_key,
-            )
+            install_span_attribute_aliases()
+            if self._options.instrument_databases:
+                # The manager patches the DB-API governance seam but instruments
+                # no driver, so without this a SQL statement raises no span at
+                # all and `dbapi` still shows as an installed target.
+                from openbox_citadel.db_drivers import install_db_driver_instrumentation
+
+                install_db_driver_instrumentation()
             if self._options.instrument_file_io:
                 # Correct the file spans the hook layer emits: canonical names,
                 # so Core does not file a write as a read, and per-operation
@@ -203,46 +216,112 @@ class OpenBoxCitadelMiddleware:
                 from openbox_citadel.file_spans import install_file_span_corrections
 
                 install_file_span_corrections()
-            _SHARED_SPAN_PROCESSOR = self._span_processor
-            _INSTRUMENTATION_READY = True
-            _INSTRUMENTED.update(
-                databases=self._options.instrument_databases,
-                file_io=self._options.instrument_file_io,
+            _SHARED_RUNTIME = self._runtime
+            _INSTALLED_TARGETS = list(
+                getattr(self._runtime._instrumentation_manager, "installed_targets", [])
             )
+            _INSTRUMENTATION_READY = True
             self._otel_ready = True
+            if not _INSTALLED_TARGETS:
+                # Every installer declining is not a success. The usual cause is
+                # a base SDK installed without its [http] extra: the OTel
+                # instrumentation packages are missing, each installer returns
+                # False, and the runtime arms over nothing. Silence here is how
+                # a governed-looking run records no spans at all.
+                logger.warning(
+                    "instrumentation armed but patched NOTHING — no spans will be "
+                    "recorded. The base SDK is most likely installed without its "
+                    "HTTP extra; install openbox-sdk-python[http]."
+                )
+            else:
+                logger.info("instrumentation installed: %s", ", ".join(_INSTALLED_TARGETS))
+            self._warn_absent_targets()
         except Exception:
             # Instrumentation is best-effort. Losing spans degrades behavior
             # rules; failing to start the turn loses the whole run.
             logger.warning("OTel instrumentation unavailable; spans disabled", exc_info=True)
 
-    def _install_extra_instrumentation(self) -> None:
-        """Add instrumentation a later middleware asks for and the first skipped.
+    def _build_core_runtime(self) -> Any:
+        """An armed `openbox_core` runtime — the only hook runtime there is.
 
-        Narrow installers only. Re-running the whole setup would re-patch httpx
-        and reintroduce the duplicate completion this guard exists to prevent.
+        This used to call `openbox_langgraph.otel_setup`, which no longer
+        installs anything: hook governance moved wholesale into the base SDK's
+        `InstrumentationManager`, and the old entry point was left as a shim
+        that raises. Nothing here is LangGraph-shaped, so it builds on
+        `openbox_core` directly rather than reaching through another
+        framework's SDK to get at it.
+
+        The runtime owns a PRIVATE `ContextStore`. The base default is a
+        process-global store and `runtime.close()` clears whatever store it
+        holds, so sharing one would let a teardown blast a concurrent turn.
         """
-        if self._options.instrument_databases and not _INSTRUMENTED["databases"]:
-            try:
-                from openbox_langgraph.otel_setup import setup_database_instrumentation
+        from openbox_core.config import InstrumentationConfig, OpenBoxConfig
+        from openbox_core.context import ContextStore
+        from openbox_core.instrumentation.manager import InstrumentationManager
+        from openbox_core.runtime import OpenBoxRuntime
 
-                setup_database_instrumentation(None, self._options.sqlalchemy_engine)
-                _INSTRUMENTED["databases"] = True
-            except Exception:  # noqa: BLE001 — best effort, like the main setup
-                logger.warning("database instrumentation unavailable", exc_info=True)
+        core_config = OpenBoxConfig.resolve(
+            env_prefix=CORE_ENV_PREFIX,
+            api_url=self._options.api_url,
+            api_key=self._options.api_key,
+            timeout_seconds=self._options.governance_timeout,
+            on_api_error=self._options.on_api_error,
+            agent_name=self._config.agent_name,
+            # Passed through so the runtime's own client signs its requests.
+            # Dropping them here would downgrade this SDK to bare-Bearer at the
+            # trust boundary while the middleware's client still signs.
+            agent_did=self._options.agent_did,
+            agent_private_key=self._options.agent_private_key,
+            sdk_version=SDK_VERSION,
+            sdk_engine=SDK_ENGINE,
+            sdk_language=SDK_LANGUAGE,
+            instrumentation=InstrumentationConfig(
+                http_enabled=self._options.instrument_http,
+                db_enabled=self._options.instrument_databases,
+                file_enabled=self._options.instrument_file_io,
+            ),
+            validate=True,
+        )
 
-        if self._options.instrument_file_io and not _INSTRUMENTED["file_io"]:
-            try:
-                from openbox_langgraph.file_governance_hooks import (
-                    setup_file_io_instrumentation,
+        store = ContextStore()
+        runtime = OpenBoxRuntime(core_config, context_store=store)
+        # extra_ignored_urls has to reach the manager at construction, so build
+        # it directly rather than through runtime.install_instrumentation(),
+        # which takes no arguments. runtime.close() still finds the manager here
+        # and calls uninstall on it. Same pattern the base SDK's conformance kit
+        # uses. Without the ignore, the runtime governs its own evaluate calls.
+        manager = InstrumentationManager(
+            runtime, extra_ignored_urls={self._options.api_url}
+        )
+        runtime._instrumentation_manager = manager
+        manager.install()
+        return runtime
+
+    def _warn_absent_targets(self) -> None:
+        """Say so when this middleware wants a target the live runtime lacks.
+
+        Instrumentation is installed once per process, by whichever middleware
+        got there first, and its config decided the targets. A later middleware
+        asking for more cannot have it retrofitted — installing a second manager
+        would re-patch httpx and stack the wrappers this guard exists to
+        prevent — so the honest move is to report it rather than let the caller
+        believe DB or file calls are being governed.
+        """
+        wanted = {
+            "HTTP": (self._options.instrument_http,
+                     ("httpx", "requests", "urllib", "urllib3")),
+            # The manager's own names, not the driver packages': one "dbapi"
+            # target covers sqlite3/psycopg2/pymysql together.
+            "databases": (self._options.instrument_databases, ("sqlalchemy", "dbapi",
+                          "asyncpg", "redis", "pymongo")),
+            "file io": (self._options.instrument_file_io, ("file",)),
+        }
+        for label, (asked, targets) in wanted.items():
+            if asked and not any(t in _INSTALLED_TARGETS for t in targets):
+                logger.warning(
+                    "%s instrumentation was requested but the live runtime was "
+                    "installed without it; those calls are not governed", label
                 )
-
-                from openbox_citadel.file_spans import install_file_span_corrections
-
-                setup_file_io_instrumentation()
-                install_file_span_corrections()
-                _INSTRUMENTED["file_io"] = True
-            except Exception:  # noqa: BLE001
-                logger.warning("file io instrumentation unavailable", exc_info=True)
 
     # ── layer 1 ─────────────────────────────────────────────────────
 
@@ -257,14 +336,49 @@ class OpenBoxCitadelMiddleware:
         exactly how this SDK shipped a version with no spans at all.
         """
         register_activity_ctx(activity_id, context)
-        if self._span_processor is not None:
-            self._span_processor.set_activity_context(self._workflow_id, activity_id, context)
+        if self._context_store is not None:
+            self._ctx_tokens[activity_id] = self._context_store.bind(
+                self._activity_context(activity_id, context)
+            )
 
     def clear_activity(self, activity_id: str) -> None:
         """Stop attributing spans to a finished activity, in both registries."""
         unregister_activity(activity_id)
-        if self._span_processor is not None:
-            self._span_processor.clear_activity_context(self._workflow_id, activity_id)
+        token = self._ctx_tokens.pop(activity_id, None)
+        if token is not None and self._context_store is not None:
+            try:
+                self._context_store.reset(token)
+            except ValueError:
+                # A ContextVar token can only be reset in the context that set
+                # it. The hook paths clear in a `finally` beside their register,
+                # so this is the odd path out — and leaving the binding is
+                # better than raising over telemetry. The next bind shadows it.
+                logger.debug("activity context token out of scope", exc_info=True)
+
+    def _activity_context(self, activity_id: str, context: dict[str, Any]) -> Any:
+        """Citadel's event dict as the base SDK's `ActivityContext`.
+
+        The hook layer resolves a span's owner from this — the ContextVar tier
+        first, which is what survives `await` under concurrent turns. Fields it
+        has no home for ride along in `metadata` rather than being dropped.
+        """
+        from openbox_core.contracts.context import ActivityContext
+
+        first_class = {
+            "workflow_id", "run_id", "workflow_type", "task_queue", "activity_id",
+            "activity_type", "agent_name", "session_id",
+        }
+        return ActivityContext(
+            workflow_id=context.get("workflow_id") or self._workflow_id,
+            run_id=context.get("run_id") or self._run_id,
+            workflow_type=context.get("workflow_type") or self._workflow_type,
+            task_queue=context.get("task_queue") or self._config.task_queue,
+            activity_id=activity_id,
+            activity_type=context.get("activity_type"),
+            agent_name=context.get("agent_name") or self._config.agent_name,
+            session_id=context.get("session_id") or self._config.session_id,
+            metadata={k: v for k, v in context.items() if k not in first_class},
+        )
 
     async def before_turn(
         self,
@@ -282,19 +396,10 @@ class OpenBoxCitadelMiddleware:
         self._run_id = run_id or str(uuid.uuid4())
         self._workflow_type = workflow_type
 
-        if self._span_processor is not None:
-            from openbox_langgraph.types import WorkflowSpanBuffer
-
-            # The buffer is what carries run_id and workflow_type onto captured
-            # spans; without it the processor has a workflow it knows nothing about.
-            self._span_processor.register_workflow(
-                self._workflow_id,
-                WorkflowSpanBuffer(
-                    workflow_id=self._workflow_id,
-                    run_id=self._run_id,
-                    workflow_type=workflow_type,
-                ),
-            )
+        # No per-workflow registration step here any more. run_id and
+        # workflow_type used to live in a WorkflowSpanBuffer keyed by
+        # workflow_id; in the core model every span resolves an ActivityContext
+        # that already carries all three, so there is nothing to pre-declare.
 
         # WorkflowStarted carries an activity id of its own, so the workflow has
         # an anchor node on the timeline rather than a bare marker.
@@ -446,8 +551,11 @@ class OpenBoxCitadelMiddleware:
                     exc_info=True,
                 )
         finally:
-            if self._span_processor is not None:
-                self._span_processor.unregister_workflow(self._workflow_id)
+            # Any activity that never reached clear_activity would otherwise
+            # keep its binding and attribute the next turn's spans to a closed
+            # activity.
+            for activity_id in list(self._ctx_tokens):
+                self.clear_activity(activity_id)
             release_sequencer(self._run_id)
 
     async def _close_dangling(self) -> None:
