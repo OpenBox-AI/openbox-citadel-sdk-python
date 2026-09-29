@@ -310,8 +310,10 @@ async def decide(request: Request) -> JSONResponse:
         return JSONResponse({"error": "nothing pending to decide"}, status_code=404)
 
     event_id = match.get("id") or match.get("event_id") or match.get("governance_event_id")
-    result = platform(f"/agent/{AGENT_ID}/approvals/{event_id}/decide",
-                      method="PUT", body={"action": action})
+    # `action` is a query parameter; the body only carries an optional patch.
+    # Sent in the body, the decision is refused with 422.
+    result = platform(f"/agent/{AGENT_ID}/approvals/{event_id}/decide?action={action}",
+                      method="PUT", body={})
     if result is None:
         return JSONResponse(
             {"error": "the decision call failed — the API key may be missing "
