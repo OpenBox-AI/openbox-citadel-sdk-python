@@ -172,3 +172,39 @@ async def test_block_becomes_the_hosts_denial(mw, client: FakeClient) -> None:
     await mw.before_turn(goal="g")
     with pytest.raises(Denied):
         await mw.govern(Decl("Apollo"), _tool)({}, Ctx())
+
+
+def test_core_block_raised_inside_a_tool_call_is_translated() -> None:
+    """A behavior rule decided on a span is raised by the base runtime with its
+    own class, wrapped by the HTTP client. It must come back as ours."""
+    from openbox_core import errors as core
+
+    from openbox_citadel.verdict import GovernanceBlockedError, unwrap_governance_error
+
+    try:
+        try:
+            raise core.GovernanceBlockedError("block", "no prior contact lookup")
+        except core.GovernanceBlockedError as inner:
+            raise ConnectionError("transport failed") from inner
+    except ConnectionError as outer:
+        found = unwrap_governance_error(outer)
+    assert isinstance(found, GovernanceBlockedError)
+    assert found.verdict == "block"
+    assert "no prior contact lookup" in str(found)
+
+
+def test_core_halt_and_hook_approval_are_translated() -> None:
+    from openbox_core import errors as core
+
+    from openbox_citadel.verdict import (
+        GovernanceBlockedError,
+        GovernanceHaltError,
+        GuardrailsValidationError,
+        unwrap_governance_error,
+    )
+
+    assert isinstance(unwrap_governance_error(core.GovernanceHaltError("stop")), GovernanceHaltError)
+    approval = unwrap_governance_error(core.GovernanceBlockedError("require_approval", "human"))
+    assert isinstance(approval, GovernanceBlockedError) and approval.verdict == "require_approval"
+    rails = unwrap_governance_error(core.GuardrailsValidationError(["PII"]))
+    assert isinstance(rails, GuardrailsValidationError) and rails.reasons == ["PII"]

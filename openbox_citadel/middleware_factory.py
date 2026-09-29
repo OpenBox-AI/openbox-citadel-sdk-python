@@ -6,6 +6,7 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+from openbox_citadel.client import _pem
 from openbox_citadel.config import DEFAULT_APPROVAL_MAX_WAIT_SECONDS, GovernanceConfig
 from openbox_citadel.middleware import (
     CORE_ENV_PREFIX,
@@ -21,6 +22,8 @@ def create_openbox_citadel_middleware(
     api_key: str | None = None,
     agent_did: str | None = None,
     agent_private_key: str | None = None,
+    workload_private_key: str | None = None,
+    okta_agent_private_key: str | None = None,
     agent_name: str | None = None,
     session_id: str | None = None,
     governance_timeout: float = 30.0,
@@ -36,6 +39,14 @@ def create_openbox_citadel_middleware(
 
     Credentials fall back to `OPENBOX_*`, which in Citadel means Doppler
     (project `squidgy`) — never a `.env` file.
+
+    Set the credentials the dashboard issued for the agent; they decide which
+    Core API it is governed through:
+
+    * `OPENBOX_AGENT_DID` + `OPENBOX_AGENT_PRIVATE_KEY` — OpenBox DID (v1)
+    * `OPENBOX_WORKLOAD_PRIVATE_KEY` — workload identity (v3)
+    * `OPENBOX_OKTA_AGENT_PRIVATE_KEY` — Okta AI Agent (v2)
+    * none of them — API key only (v1, legacy agents)
     """
     resolved_url = api_url or os.environ.get("OPENBOX_API_URL", "https://core.openbox.ai")
     resolved_key = api_key or os.environ.get("OPENBOX_API_KEY", "")
@@ -50,6 +61,15 @@ def create_openbox_citadel_middleware(
         raise ValueError(
             f"on_api_error must be 'fail_open' or 'fail_closed', got {resolved_policy!r}"
         )
+
+    resolved_did = agent_did or os.environ.get("OPENBOX_AGENT_DID")
+    resolved_did_key = agent_private_key or os.environ.get("OPENBOX_AGENT_PRIVATE_KEY")
+    resolved_workload_key = _pem(
+        workload_private_key or os.environ.get("OPENBOX_WORKLOAD_PRIVATE_KEY")
+    )
+    resolved_okta_key = _pem(
+        okta_agent_private_key or os.environ.get("OPENBOX_OKTA_AGENT_PRIVATE_KEY")
+    )
 
     resolved_config = config or GovernanceConfig()
     resolved_config.task_queue = TASK_QUEUE
@@ -71,9 +91,10 @@ def create_openbox_citadel_middleware(
             api_url=resolved_url,
             api_key=resolved_key,
             timeout_seconds=governance_timeout,
-            agent_did=agent_did or os.environ.get("OPENBOX_AGENT_DID"),
-            agent_private_key=agent_private_key
-            or os.environ.get("OPENBOX_AGENT_PRIVATE_KEY"),
+            agent_did=resolved_did,
+            agent_private_key=resolved_did_key,
+            workload_private_key=resolved_workload_key,
+            okta_agent_private_key=resolved_okta_key,
             validate=True,
         )
 
@@ -81,9 +102,10 @@ def create_openbox_citadel_middleware(
         OpenBoxCitadelMiddlewareOptions(
             api_url=resolved_url,
             api_key=resolved_key,
-            agent_did=agent_did or os.environ.get("OPENBOX_AGENT_DID"),
-            agent_private_key=agent_private_key
-            or os.environ.get("OPENBOX_AGENT_PRIVATE_KEY"),
+            agent_did=resolved_did,
+            agent_private_key=resolved_did_key,
+            workload_private_key=resolved_workload_key,
+            okta_agent_private_key=resolved_okta_key,
             governance_timeout=governance_timeout,
             on_api_error=resolved_policy,
             config=resolved_config,
