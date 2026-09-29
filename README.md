@@ -39,9 +39,26 @@ finally:
     await mw.after_turn()
 ```
 
-`initialize()` reads `OPENBOX_API_URL`, `OPENBOX_API_KEY`, `OPENBOX_AGENT_DID`,
-`OPENBOX_AGENT_PRIVATE_KEY` and `OPENBOX_ON_API_ERROR` from the environment —
+`initialize()` reads `OPENBOX_API_URL`, `OPENBOX_API_KEY`, the agent's identity
+credentials (below) and `OPENBOX_ON_API_ERROR` from the environment —
 which in Citadel means Doppler, project `squidgy`, never a `.env`.
+
+### Agent identity
+
+Core serves each kind of agent identity on its own API version and refuses a
+request on the wrong one (`method_endpoint_mismatch`). Set the credentials the
+dashboard issued for the agent; the SDK picks the route from them:
+
+| Agent identity in the dashboard | Set | Core API |
+|---|---|---|
+| Workload identity (OpenBox, Okta or Entra service account) | `OPENBOX_WORKLOAD_PRIVATE_KEY` | `/api/v3` |
+| OpenBox DID | `OPENBOX_AGENT_DID` + `OPENBOX_AGENT_PRIVATE_KEY` | `/api/v1`, signed |
+| Okta AI Agent | `OPENBOX_OKTA_AGENT_PRIVATE_KEY` | `/api/v2` |
+| API key only (legacy) | none of the above | `/api/v1` |
+
+The workload key can be pasted exactly as the dashboard shows it — quoted, on
+one line, with `\n` — or as a normal multi-line PEM. Routing, the Keycloak
+token exchange and its refresh come from `openbox-sdk-python` ≥ 1.3.1.
 
 Not calling `initialize()` *is* the off switch: `new_run()` returns `None` and
 every wrapper degrades to a passthrough.

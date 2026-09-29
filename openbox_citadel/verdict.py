@@ -133,8 +133,41 @@ def unwrap_governance_error(exc: BaseException | None) -> BaseException | None:
         seen.add(id(current))
         if isinstance(current, GovernanceError):
             return current
+        translated = _from_core_error(current)
+        if translated is not None:
+            return translated
         current = current.__cause__ or current.__context__
     return None
+
+
+def _from_core_error(exc: BaseException) -> BaseException | None:
+    """The base SDK's governance errors, as this SDK's own.
+
+    A refusal decided on a span — a behavior rule, or a hook-level policy on an
+    HTTP, DB or file call — is raised by the base runtime's instrumentation,
+    with `openbox_core`'s classes, from inside the tool's own call. Left as
+    they are, they miss every `GovernanceError` check, so the host gets an
+    OpenBox type instead of its `deny_exc`, and a hook-level approval is never
+    polled.
+    """
+    from openbox_core import errors as core
+
+    if isinstance(exc, core.GovernanceHaltError):
+        translated: BaseException = GovernanceHaltError(str(exc))
+    elif isinstance(exc, core.GovernanceBlockedError):
+        verdict = getattr(exc.verdict, "value", exc.verdict)
+        arm = verdict_from_string(verdict)
+        message = exc.reason or str(exc)
+        translated = (
+            GovernanceHaltError(message) if arm == "halt"
+            else GovernanceBlockedError(arm if arm != "allow" else "block", message)
+        )
+    elif isinstance(exc, core.GuardrailsValidationError):
+        translated = GuardrailsValidationError(list(exc.reasons))
+    else:
+        return None
+    translated.__cause__ = exc
+    return translated
 
 
 def format_activity_rejected_message(reason: Any) -> str:

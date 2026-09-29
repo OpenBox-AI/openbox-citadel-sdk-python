@@ -1,19 +1,37 @@
 """HTTP client for Core's governance endpoints.
 
-Its own client rather than the base SDK's, for one reason: the base
-`ApprovalPollParams` carries only `(workflow_id, run_id, activity_id)` and has
-nowhere to put the approval id Core returns on a `require_approval` verdict.
+Its own client rather than the base SDK's `GovernanceGate`, for one reason: the
+base `ApprovalPollParams` carries only `(workflow_id, run_id, activity_id)` and
+has nowhere to put the approval id Core returns on a `require_approval` verdict.
 Polling without it asks Core about a key it is not tracking the approval under.
+
+Transport and authentication are the base `EvaluationClient`'s, though. Core now
+gates every runtime route on the agent's identity method, and the method picks
+the route family:
+
+    legacy_unsigned, openbox_did  ->  /api/v1   (API key, + DID signature)
+    okta_ai_agent                 ->  /api/v2   (API key + RS256 assertion)
+    keycloak_workload             ->  /api/v3   (API key + workload token)
+
+A request on the wrong family is refused with `method_endpoint_mismatch`, so
+hard-coding v1 here broke every agent the dashboard now creates with a workload
+identity. The base client already owns that selection, the Keycloak token
+exchange and its refresh; duplicating them would mean two implementations of a
+security contract drifting apart.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from openbox_core.identity import AgentIdentity, prepare_signed_request
+from openbox_core.client import EvaluationClient
+from openbox_core.errors import GovernanceAPIError, OpenBoxNetworkError
+from openbox_core.errors import OpenBoxAuthError as CoreAuthError
+from openbox_core.identity import AgentIdentity
 
 from openbox_citadel.types import to_server_event_type
 
@@ -21,7 +39,7 @@ logger = logging.getLogger("openbox_citadel.client")
 
 SDK_ENGINE = "citadel"
 SDK_LANGUAGE = "python"
-SDK_VERSION = "0.1.0"
+SDK_VERSION = "0.2.0"
 
 
 def _optional_identity(did: str | None, private_key: str | None) -> AgentIdentity | None:
@@ -42,6 +60,18 @@ def _optional_identity(did: str | None, private_key: str | None) -> AgentIdentit
     return AgentIdentity.from_private_key(did, private_key)
 
 
+def _pem(value: str | None) -> str | None:
+    """A PEM from an env var, with literal `\\n` restored to newlines.
+
+    The dashboard hands the workload key out JSON-quoted on one line, and most
+    secret stores keep it that way.
+    """
+    value = (value or "").strip().strip('"') or None
+    if value is not None and "\\n" in value:
+        value = value.replace("\\n", "\n").strip()
+    return value
+
+
 class OpenBoxAuthError(Exception):
     """The credential was rejected — 401 or 403.
 
@@ -49,8 +79,24 @@ class OpenBoxAuthError(Exception):
     "carry on ungoverned" under `fail_open`.
     """
 
-EVALUATE_PATH = "/api/v1/governance/evaluate"
-APPROVAL_PATH = "/api/v1/governance/approval"
+
+class _CitadelEvaluationClient(EvaluationClient):
+    """The base client with Citadel's timeouts.
+
+    Read is generous because Core's own server-side timeout on session close is
+    30s; a shorter one here abandons the request before Core answers and loses
+    the terminal event. Connect stays tight — an unreachable Core should fail
+    fast, not hang. The base client takes a single scalar timeout, so this is
+    the one seam overridden.
+    """
+
+    def _async(self) -> Any:
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout, connect=5.0, read=max(self._timeout, 60.0)),
+                transport=self._async_transport,
+            )
+        return self._async_client
 
 
 class GovernanceClient:
@@ -66,66 +112,50 @@ class GovernanceClient:
         fail_hard_on_auth_error: bool = True,
         agent_did: str | None = None,
         agent_private_key: str | None = None,
+        workload_private_key: str | None = None,
+        okta_agent_private_key: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._api_url = api_url.rstrip("/")
-        self._api_key = api_key
-        self._timeout = timeout
         self._on_api_error = on_api_error
         self._fail_hard_on_auth_error = fail_hard_on_auth_error
-        self._client: httpx.AsyncClient | None = None
-        self._identity = _optional_identity(agent_did, agent_private_key)
-
-    def _http(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
-            # Read timeout is generous because Core's own server-side timeout on
-            # session close is 30s; a shorter one here abandons the request
-            # before Core answers and loses the terminal event. Connect stays
-            # tight — an unreachable Core should fail fast, not hang.
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self._timeout, connect=5.0, read=max(self._timeout, 60.0))
+        identity = _optional_identity(agent_did, agent_private_key)
+        okta_key = _pem(okta_agent_private_key)
+        if identity is not None and okta_key is not None:
+            raise ValueError(
+                "OPENBOX_AGENT_DID/OPENBOX_AGENT_PRIVATE_KEY and "
+                "OPENBOX_OKTA_AGENT_PRIVATE_KEY are two different agent identities; "
+                "set the one the dashboard issued for this agent."
             )
-        return self._client
-
-    async def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            await self._client.aclose()
-        self._client = None
-
-    async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-        import json
-
-        # Core hashes the body it is given and Core verifies that hash, so the
-        # bytes signed must be the bytes sent — `prepare_signed_request` returns
-        # both together for exactly that reason. Never re-serialize with `json=`.
-        #
-        # The round-trip through `default=str` first is what keeps a datetime or
-        # UUID anywhere in an event from raising: core's serializer is strict,
-        # and this SDK's payloads have always been built leniently.
-        plain = json.loads(json.dumps(payload, default=str))
-        headers, body = prepare_signed_request(
-            "POST",
-            path,
-            plain,
-            api_key=self._api_key,
-            identity=self._identity,
+        # A workload key composes with either: while Core advertises a workload
+        # authority for this agent the v3 token wins, and when it does not the
+        # request stays on the route the other credentials select.
+        self._base = _CitadelEvaluationClient(
+            self._api_url,
+            api_key,
+            timeout_seconds=timeout,
+            on_api_error=on_api_error,
+            identity=identity,
+            okta_bootstrap_private_key=okta_key,
+            workload_private_key=_pem(workload_private_key),
             sdk_version=SDK_VERSION,
             sdk_engine=SDK_ENGINE,
             sdk_language=SDK_LANGUAGE,
+            async_transport=transport,
         )
-        headers.setdefault("Content-Type", "application/json")
-        response = await self._http().post(f"{self._api_url}{path}", content=body, headers=headers)
-        if response.status_code in (401, 403):
-            # Distinct from a transport failure: this will not come right on
-            # retry, so it must not be swallowed by fail_open.
-            raise OpenBoxAuthError(
-                f"OpenBox rejected the credential ({response.status_code}) "
-                f"on {path}: {response.text[:200]}"
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"OpenBox {path} returned {response.status_code}: {response.text[:300]}")
-        if not response.content:
-            return None
-        return response.json()
+
+    async def close(self) -> None:
+        await self._base.aclose()
+
+    @staticmethod
+    def _plain(payload: dict[str, Any]) -> dict[str, Any]:
+        # The round-trip through `default=str` is what keeps a datetime or UUID
+        # anywhere in an event from raising: core's serializer is strict, and
+        # this SDK's payloads have always been built leniently.
+        return json.loads(json.dumps(payload, default=str))
+
+    def _auth_failure(self, path: str, exc: Exception) -> OpenBoxAuthError:
+        return OpenBoxAuthError(f"OpenBox rejected the credential on {path}: {exc}")
 
     async def evaluate(self, event: dict[str, Any]) -> dict[str, Any] | None:
         """Send one governance event. `None` when failing open on a transport error.
@@ -134,24 +164,35 @@ class GovernanceClient:
         at the last possible moment, so logs and the sequencer keep the
         descriptive form while Core gets one of the six it accepts.
         """
-        payload = {**event, "event_type": to_server_event_type(event.get("event_type", ""))}
+        payload = self._plain({**event, "event_type": to_server_event_type(event.get("event_type", ""))})
         try:
-            return await self._post(EVALUATE_PATH, payload)
-        except OpenBoxAuthError:
+            result = await self._base.aevaluate(payload)
+        except CoreAuthError as exc:
+            # Includes the signing/assertion rejections, which carry Core's
+            # reason code (e.g. method_endpoint_mismatch) in the message.
             if self._fail_hard_on_auth_error:
-                raise
+                raise self._auth_failure("governance/evaluate", exc) from exc
             logger.error(
                 "OpenBox credential rejected; continuing UNGOVERNED because "
-                "fail_hard_on_auth_error is off"
+                "fail_hard_on_auth_error is off: %s", exc
             )
             return None
-        except Exception:
+        except (GovernanceAPIError, OpenBoxNetworkError):
+            # GovernanceAPIError is only raised under fail_closed. A network
+            # error here is the workload bootstrap or token exchange failing,
+            # which is as much a transport failure as Core being down.
             if self._on_api_error == "fail_closed":
                 raise
             logger.warning(
                 "governance %s failed; failing open", event.get("event_type"), exc_info=True
             )
             return None
+        if result.fallback_used:
+            # The base client's fail_open ALLOW. This SDK has always signalled
+            # "no verdict" as None so callers cannot mistake it for a policy allow.
+            logger.warning("governance %s failed; failing open", event.get("event_type"))
+            return None
+        return result.raw
 
     async def poll_approval(
         self,
@@ -168,41 +209,36 @@ class GovernanceClient:
         addresses it. Only without one do we fall back to the run triple.
         """
         if approval_id:
-            payload = {
-                "workflow_id": approval_id,
-                "run_id": approval_id,
-                "activity_id": approval_id,
-            }
+            key = (approval_id, approval_id, approval_id)
         else:
-            payload = {
-                "workflow_id": workflow_id,
-                "run_id": run_id,
-                "activity_id": activity_id,
-            }
+            key = (workflow_id, run_id, activity_id)
 
         try:
-            data = await self._post(APPROVAL_PATH, payload)
-        except OpenBoxAuthError:
+            result = await self._base.apoll_approval(*key)
+        except CoreAuthError as exc:
             if self._fail_hard_on_auth_error:
-                raise
+                raise self._auth_failure("governance/approval", exc) from exc
             return None
-        except Exception:
+        except (GovernanceAPIError, OpenBoxNetworkError):
             if self._on_api_error == "fail_closed":
                 raise
             return None
-        if data is None:
+        if result is None:
             return None
 
-        # Expiry is a client-side check — Core sends the expiration time, not an
-        # `expired` flag.
-        expiration = data.get("approval_expiration_time") or data.get("approvalExpirationTime")
-        if isinstance(expiration, str) and expiration.strip():
+        # The base client has already set `expired` from the snake_case field;
+        # Core has also been seen sending the camelCase one.
+        data = dict(result.raw)
+        expiration = data.get("approvalExpirationTime")
+        if not data.get("expired") and isinstance(expiration, str) and expiration.strip():
             try:
                 expires_at = datetime.fromisoformat(expiration)
             except ValueError:
                 return data
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
             if expires_at < datetime.now(UTC):
-                return {**data, "expired": True}
+                data["expired"] = True
         return data
 
 

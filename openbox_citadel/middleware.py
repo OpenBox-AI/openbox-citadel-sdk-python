@@ -49,7 +49,7 @@ CORE_ENV_PREFIX = "OPENBOX_CITADEL"
 
 SDK_ENGINE = "citadel"
 SDK_LANGUAGE = "python"
-SDK_VERSION = "0.1.0"
+SDK_VERSION = "0.2.0"
 
 TASK_QUEUE = "citadel"
 """Framework identifier. The live server accepts any string and new frameworks
@@ -65,6 +65,13 @@ class OpenBoxCitadelMiddlewareOptions:
     api_key: str
     agent_did: str | None = None
     agent_private_key: str | None = None
+    workload_private_key: str | None = None
+    """PKCS8 PEM for an agent with a workload identity (Keycloak, Okta or Entra
+    service account) — the `OPENBOX_WORKLOAD_PRIVATE_KEY` the dashboard issues.
+    Core serves those agents on /api/v3 only."""
+    okta_agent_private_key: str | None = None
+    """PKCS8 PEM for an `okta_ai_agent` agent (/api/v2). The rest of its identity
+    is fetched from Core, so the key is the only Okta value to configure."""
     governance_timeout: float = 30.0
     on_api_error: str = "fail_open"
     config: GovernanceConfig = field(default_factory=GovernanceConfig)
@@ -137,6 +144,8 @@ class OpenBoxCitadelMiddleware:
             fail_hard_on_auth_error=options.config.fail_hard_on_auth_error,
             agent_did=options.agent_did,
             agent_private_key=options.agent_private_key,
+            workload_private_key=options.workload_private_key,
+            okta_agent_private_key=options.okta_agent_private_key,
         )
         self._otel_ready = False
         self._runtime: Any = None
@@ -272,6 +281,11 @@ class OpenBoxCitadelMiddleware:
             # trust boundary while the middleware's client still signs.
             agent_did=self._options.agent_did,
             agent_private_key=self._options.agent_private_key,
+            # Same for the workload and Okta keys: the runtime's hook
+            # evaluations must take the route this agent's method requires,
+            # or every span is refused while the tool calls themselves pass.
+            workload_private_key=self._options.workload_private_key,
+            okta_agent_private_key=self._options.okta_agent_private_key,
             sdk_version=SDK_VERSION,
             sdk_engine=SDK_ENGINE,
             sdk_language=SDK_LANGUAGE,
