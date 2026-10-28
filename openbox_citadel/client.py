@@ -39,7 +39,7 @@ logger = logging.getLogger("openbox_citadel.client")
 
 SDK_ENGINE = "citadel"
 SDK_LANGUAGE = "python"
-SDK_VERSION = "0.2.0"
+SDK_VERSION = "0.3.0"
 
 
 def _optional_identity(did: str | None, private_key: str | None) -> AgentIdentity | None:

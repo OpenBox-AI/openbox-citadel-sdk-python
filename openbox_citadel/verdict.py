@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from openbox_citadel.types import VerdictArm, patch_from, with_patch_hint
@@ -65,6 +66,12 @@ def _field(response: Any, *names: str) -> Any:
     return None
 
 
+logger = logging.getLogger("openbox_citadel.verdict")
+
+# Phases evaluated after the tool/LLM call already ran.
+_COMPLETION_PHASES = frozenset({"tool_end", "llm_end"})
+
+
 class VerdictResult:
     """What the caller should do next."""
 
@@ -107,6 +114,19 @@ def enforce_verdict(response: Any, phase: str) -> VerdictResult:
             r.get("reason") if isinstance(r, dict) else getattr(r, "reason", None) for r in raw
         ]
         raise GuardrailsValidationError([r for r in reasons if isinstance(r, str) and r])
+
+    if arm == "require_approval" and phase in _COMPLETION_PHASES:
+        # The call already ran: approval cannot gate it, and waiting only
+        # stalls the turn until someone approves by hand. Same behavior as the
+        # other OpenBox framework SDKs.
+        logger.warning(
+            "REQUIRE_APPROVAL returned after the operation completed (%s); "
+            "continuing without waiting. Match the rule on ActivityStarted to "
+            "gate the operation.%s",
+            phase,
+            f" Reason: {reason}" if reason else "",
+        )
+        return VerdictResult()
 
     if arm == "require_approval":
         # Core's own approval id, not our activity id. Polling with the wrong

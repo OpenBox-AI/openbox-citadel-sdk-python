@@ -139,6 +139,24 @@ async def test_dangling_activity_is_closed_at_run_end(mw, client: FakeClient) ->
     assert client.types[-1] == "WorkflowCompleted"
 
 
+async def test_failed_dangling_close_does_not_escape_after_turn(mw, client: FakeClient) -> None:
+    """After a HALT Core has closed the session and rejects further events.
+    after_turn runs from the host's finally block, so that rejection must not
+    replace the error the turn is already raising."""
+    from openbox_citadel.events import build_event
+
+    await mw.before_turn(goal="g")
+    await mw._evaluate(build_event(mw, "ActivityStarted", "orphan-2", "Leaked"))
+    client.fail = True
+
+    await mw.after_turn(status="halted", error=RuntimeError("halted by policy"))
+
+    assert any(
+        e["event_type"] == "ActivityCompleted" and e["activity_id"] == "orphan-2"
+        for e in client.events
+    )
+
+
 # ── wire event names ────────────────────────────────────────────────
 
 

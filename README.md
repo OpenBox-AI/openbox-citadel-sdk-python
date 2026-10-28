@@ -58,7 +58,7 @@ dashboard issued for the agent; the SDK picks the route from them:
 
 The workload key can be pasted exactly as the dashboard shows it — quoted, on
 one line, with `\n` — or as a normal multi-line PEM. Routing, the Keycloak
-token exchange and its refresh come from `openbox-sdk-python` ≥ 1.3.1.
+token exchange and its refresh come from `openbox-sdk-python` ≥ 1.5.0.
 
 Not calling `initialize()` *is* the off switch: `new_run()` returns `None` and
 every wrapper degrades to a passthrough.

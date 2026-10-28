@@ -56,6 +56,36 @@ def test_approval_id_is_carried_off_the_verdict() -> None:
     assert result.requires_hitl and result.approval_id == "apr_9"
 
 
+@pytest.mark.parametrize("phase", ["tool_end", "llm_end"])
+def test_completion_stage_approval_does_not_wait(phase, caplog) -> None:
+    """The call already ran; an approval cannot gate it. Logged, not awaited."""
+    with caplog.at_level("WARNING", logger="openbox_citadel.verdict"):
+        result = enforce_verdict({"arm": "require_approval", "reason": "review it"}, phase)
+    assert result.requires_hitl is False
+    assert "after the operation completed" in caplog.text
+    assert "review it" in caplog.text
+
+
+def test_start_stage_approval_still_waits() -> None:
+    assert enforce_verdict({"arm": "require_approval"}, "tool_start").requires_hitl
+
+
+async def test_completion_stage_approval_returns_the_tool_result(mw, client: FakeClient) -> None:
+    """End to end through the tool hook: no approval poll after the tool ran."""
+    original = client.evaluate
+
+    async def approval_on_completion(event):
+        response = await original(event)
+        if event["event_type"] == "ActivityCompleted":
+            response["arm"] = "require_approval"
+        return response
+
+    client.evaluate = approval_on_completion  # type: ignore[method-assign]
+    await mw.before_turn(goal="g")
+    assert await mw.govern(Decl("Refund"), _tool)({}, Ctx()) == "ok"
+    assert client.polls == []
+
+
 # ── patch ───────────────────────────────────────────────────────────
 
 

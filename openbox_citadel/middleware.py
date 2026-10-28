@@ -49,7 +49,7 @@ CORE_ENV_PREFIX = "OPENBOX_CITADEL"
 
 SDK_ENGINE = "citadel"
 SDK_LANGUAGE = "python"
-SDK_VERSION = "0.2.0"
+SDK_VERSION = "0.3.0"
 
 TASK_QUEUE = "citadel"
 """Framework identifier. The live server accepts any string and new frameworks
@@ -582,16 +582,25 @@ class OpenBoxCitadelMiddleware:
         for activity_id in sequencer_for(self._run_id).dangling_activities():
             logger.warning("closing dangling activity %s", activity_id)
             unregister_activity(activity_id)
-            await self._evaluate(
-                build_event(
-                    self,
-                    "ActivityCompleted",
-                    activity_id,
-                    None,
-                    status="failed",
-                    error={"type": "DanglingActivity", "message": "closed at workflow end"},
+            # Best effort, like the terminal event: after a HALT Core has
+            # already closed the session and rejects this with 400, and under
+            # fail_closed that error would replace the halt the caller is owed
+            # (after_turn runs from the host's finally block).
+            try:
+                await self._evaluate(
+                    build_event(
+                        self,
+                        "ActivityCompleted",
+                        activity_id,
+                        None,
+                        status="failed",
+                        error={"type": "DanglingActivity", "message": "closed at workflow end"},
+                    )
                 )
-            )
+            except Exception:
+                logger.warning(
+                    "dangling activity %s could not be closed", activity_id, exc_info=True
+                )
 
     def govern(self, decl: Any, call: Any) -> Any:
         """Wrap one bound tool. Compose INSIDE Citadel's `guarded()`."""
